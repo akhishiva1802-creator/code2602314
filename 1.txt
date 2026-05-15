@@ -1,170 +1,41 @@
-package com.companyname.datamigrationservice.service.impl;
-
-import com.companyname.datamigrationservice.dto.request.MigrationRequest;
-import com.companyname.datamigrationservice.dto.response.CancelJobResponse;
-import com.companyname.datamigrationservice.dto.response.JobStatusResponse;
-import com.companyname.datamigrationservice.dto.response.JobSubmitResponse;
-import com.companyname.datamigrationservice.enums.Environment;
-import com.companyname.datamigrationservice.enums.JobStatus;
-import com.companyname.datamigrationservice.model.MigrationJob;
-import com.companyname.datamigrationservice.service.JobService;
-import com.companyname.datamigrationservice.util.JobIdGenerator;
-import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.stereotype.Service;
-
-import java.time.LocalDateTime;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.concurrent.atomic.AtomicLong;
-
-/**
- * Job lifecycle manager — backed by MigrationJobsStorage for local file persistence.
- *
- * Key rules enforced here:
- *   1. Job ID format = {targetSchema}_{targetTable}_{NNN}
- *   2. Only one active migration per (environment + target schema + target table)
- *   3. Environment must be specified for every job
- */
 @Slf4j
-@Service
+@Component
 @RequiredArgsConstructor
-public class JobServiceImpl implements JobService {
+public class MigrationJobsStorage {
 
-    private final MigrationJobsStorage store;
     private final JobIdGenerator jobIdGenerator;
 
-    @Override
-    public JobSubmitResponse submitJob(MigrationRequest request) {
-        // --- Rule: prevent duplicate migration on same target table in same environment
-        checkNoActiveMigrationForTarget(
-                request.getEnvironment(),
-                request.getTargetSchema(),
-                request.getTargetTable()
-        );
+    private ObjectMapper objectMapper;
+    private final Map<String, MigrationJob> cache = new ConcurrentHashMap<>();
 
-        // --- Generate the new-format job ID
-        String jobId = jobIdGenerator.generate(request.getTargetSchema(), request.getTargetTable());
+    @Value("${migration.storage.folder-path:./data/jobs}")
+    private String folderPath;
 
-        MigrationJob job = MigrationJob.builder()
-                .jobId(jobId)
-                .status(JobStatus.PENDING)
-                .environment(request.getEnvironment())
-                .sourceSchema(request.getSourceSchema())
-                .sourceTable(request.getSourceTable())
-                .targetSchema(request.getTargetSchema())
-                .targetTable(request.getTargetTable())
-                .batchSize(request.getBatchSize())
-                .totalRows(0L)
-                .rowsProcessed(new AtomicLong(0))
-                .lastCheckpoint(0L)
-                .startTime(LocalDateTime.now())
-                .build();
-
-        store.getCache().put(jobId, job);
-        store.persist(job);
-
-        log.info("Created job: jobId={}, env={}, source={}.{}, target={}.{}",
-                jobId, request.getEnvironment(),
-                request.getSourceSchema(), request.getSourceTable(),
-                request.getTargetSchema(), request.getTargetTable());
-
-        return new JobSubmitResponse(
-                jobId,
-                JobStatus.PENDING,
-                request.getEnvironment(),
-                "Job created and pending execution."
-        );
+    @PostConstruct
+    public void init() {
+        // ... objectMapper setup ...
+        loadOnStartup();
     }
 
-    @Override
-    public JobStatusResponse getJobStatus(String jobId) {
-        MigrationJob job = store.getCache().get(jobId);
-        if (job == null) {
-            throw new IllegalArgumentException("Job not found: " + jobId);
-        }
-        return toResponse(job);
+    // ... loadOnStartup, loadOneJob, syncJobIdCounters ...
+
+    public Map<String, MigrationJob> getCache() {
+        return cache;
     }
 
-    @Override
-    public List<JobStatusResponse> listAllJobs() {
-        return store.getCache().values().stream()
-                .map(this::toResponse)
-                .toList();
-    }
-
-    @Override
-    public CancelJobResponse cancelJob(String jobId) {
-        Map<String, MigrationJob> cache = store.getCache();
-        MigrationJob job = cache.get(jobId);
-        if (job == null) {
-            throw new IllegalArgumentException("Job not found: " + jobId);
-        }
-
-        if (job.getStatus() == JobStatus.COMPLETED || job.getStatus() == JobStatus.FAILED) {
-            throw new IllegalStateException("Cannot cancel job in status: " + job.getStatus());
-        }
-
-        job.setStatus(JobStatus.CANCELLED);
-        job.setEndTime(LocalDateTime.now());
-        store.persist(job);
-
-        log.info("Cancelled job: jobId={}", jobId);
-
-        return new CancelJobResponse(
-                jobId,
-                JobStatus.CANCELLED,
-                "Job cancelled successfully."
-        );
-    }
-
-    /**
-     * Throws 409 Conflict if an active migration already exists for this
-     * (environment + targetSchema + targetTable) combination.
-     */
-    private void checkNoActiveMigrationForTarget(Environment env, String targetSchema, String targetTable) {
-        Optional<MigrationJob> active = store.getCache().values().stream()
-                .filter(j -> j.getEnvironment() == env)
-                .filter(j -> j.getTargetSchema().equalsIgnoreCase(targetSchema))
-                .filter(j -> j.getTargetTable().equalsIgnoreCase(targetTable))
-                .filter(j -> j.getStatus() == JobStatus.PENDING || j.getStatus() == JobStatus.RUNNING)
-                .findFirst();
-
-        if (active.isPresent()) {
-            throw new IllegalStateException(String.format(
-                    "A migration is already in progress for target %s.%s in environment %s (jobId: %s)",
-                    targetSchema, targetTable, env, active.get().getJobId()
-            ));
+    // ← THE KEY METHOD
+    public void persist(MigrationJob job) {
+        try {
+            File folder = new File(folderPath);
+            if (!folder.exists()) {
+                folder.mkdirs();
+            }
+            File file = new File(folder, job.getJobId() + ".json");
+            objectMapper.writeValue(file, job);
+        } catch (IOException e) {
+            log.error("Failed to persist job: {}", job.getJobId(), e);
         }
     }
 
-    /**
-     * Converts internal MigrationJob to a clean response DTO.
-     * Computes progress percentage on the fly.
-     */
-    private JobStatusResponse toResponse(MigrationJob job) {
-        long processed = job.getRowsProcessedCount();
-        long total = job.getTotalRows();
-
-        String progress = total > 0
-                ? String.format("%.1f%%", (processed * 100.0) / total)
-                : "0.0%";
-
-        return JobStatusResponse.builder()
-                .jobId(job.getJobId())
-                .status(job.getStatus())
-                .environment(job.getEnvironment())
-                .sourceSchema(job.getSourceSchema())
-                .sourceTable(job.getSourceTable())
-                .targetSchema(job.getTargetSchema())
-                .targetTable(job.getTargetTable())
-                .totalRows(total)
-                .rowsProcessed(processed)
-                .progressPercentage(progress)
-                .startTime(job.getStartTime())
-                .endTime(job.getEndTime())
-                .errorMessage(job.getErrorMessage())
-                .build();
-    }
+    public void delete(String jobId) { ... }
 }
